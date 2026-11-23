@@ -25,6 +25,11 @@ from tilelang.jit import JITKernel
 from tilelang import __version__
 import platform
 
+# Version of the runtime-helper ABI baked into generated RISC-V artifacts.
+# Bump this whenever the emitted helpers change in a way that makes a
+# previously cached RISC-V binary unsafe to reuse.
+_RISCV_RUNTIME_CACHE_VERSION = 1
+
 
 class KernelCache:
     """
@@ -243,6 +248,12 @@ class KernelCache:
             "compile_flags": compile_flags,
             **self._get_base_key(),
         }
+        if "riscv" in str(target).lower():
+            # Generated RISC-V artifacts embed runtime helper implementations
+            # whose ABI contract can change independently of the TileLang
+            # version.  Keep stale binaries from being reused after such a
+            # change.
+            key_data["riscv_runtime_version"] = _RISCV_RUNTIME_CACHE_VERSION
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         # Use SHA256 to generate hash key

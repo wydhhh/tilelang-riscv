@@ -345,12 +345,127 @@ def _emit_math_helpers(llvm_ir: str) -> str:
     )
 
 
+def _bf16_abi_helper_source() -> str:
+    """Emit BF16 conversion helpers with the FP return ABI LLVM callers expect.
+
+    LLVM lowers some bf16 conversions to libcalls to ``__truncsfbf2`` /
+    ``__truncdfbf2``.  The shared MLIR runtime defines those helpers with
+    ``BF16ABIType = uint16_t`` on non-x86 targets, so on RISC-V lp64d the
+    result is returned in ``a0`` while the generated caller reads it from
+    ``fa0``.  Define strong, hidden local copies that return ``float``
+    instead: the bf16 bit pattern is placed in the low half of the FP
+    register the caller expects, which matches both hard- and soft-float
+    ABIs.
+
+    The conversions are implemented with integer bit operations only so the
+    freestanding qemu harness never needs libcalls such as ``__truncdfsf2``.
+    """
+    return "\n".join(
+        [
+            "static unsigned short tilelang_riscv_bf16_from_f32_bits(float value) {",
+            "  union { float f; unsigned int u; } bits;",
+            "  unsigned int raw;",
+            "  unsigned int lsb;",
+            "  bits.f = value;",
+            "  raw = bits.u;",
+            "  if ((raw & 0x7fffffffu) > 0x7f800000u) {",
+            "    return (unsigned short)((raw & 0x80000000u) ? 0xffc0u : 0x7fc0u);",
+            "  }",
+            "  lsb = (raw >> 16) & 1u;",
+            "  raw += 0x7fffu + lsb;",
+            "  return (unsigned short)(raw >> 16);",
+            "}",
+            "",
+            "static float tilelang_riscv_f32_from_bf16_bits(unsigned short bits) {",
+            "  union { unsigned int u; float f; } raw;",
+            "  raw.u = (unsigned int)bits;",
+            "  return raw.f;",
+            "}",
+            "",
+            "static unsigned short tilelang_riscv_bf16_from_f64_bits(double value) {",
+            "  union { double d; unsigned long long u; } in;",
+            "  unsigned long long raw;",
+            "  unsigned long long sign;",
+            "  unsigned long long exponent;",
+            "  unsigned long long significand;",
+            "  long unbiased;",
+            "  in.d = value;",
+            "  raw = in.u;",
+            "  sign = (raw >> 63) & 1ull;",
+            "  exponent = (raw >> 52) & 0x7ffull;",
+            "  significand = raw & 0xfffffffffffffull;",
+            "  if (exponent == 0x7ffull) {",
+            "    return (unsigned short)((sign << 15) | (significand ? 0x7fc0u : 0x7f80u));",
+            "  }",
+            "  if (exponent == 0) {",
+            "    return (unsigned short)(sign << 15);",
+            "  }",
+            "  unbiased = (long)exponent - 1023;",
+            "  significand |= 1ull << 52;",
+            "  if (unbiased >= -126) {",
+            "    unsigned long long kept = significand >> 45;",
+            "    unsigned long long remainder = significand & ((1ull << 45) - 1ull);",
+            "    unsigned long long halfway = 1ull << 44;",
+            "    if (remainder > halfway || (remainder == halfway && (kept & 1ull))) {",
+            "      kept += 1ull;",
+            "    }",
+            "    if (kept == 256ull) {",
+            "      kept = 128ull;",
+            "      unbiased += 1;",
+            "    }",
+            "    if (unbiased > 127) {",
+            "      return (unsigned short)((sign << 15) | 0x7f80u);",
+            "    }",
+            "    return (unsigned short)((sign << 15) | ((unsigned long long)(unbiased + 127) << 7) | (kept & 0x7full));",
+            "  }",
+            "  if (unbiased < -134) {",
+            "    return (unsigned short)(sign << 15);",
+            "  }",
+            "  {",
+            "    int shift = -(int)(unbiased + 81);",
+            "    unsigned long long kept = significand >> shift;",
+            "    unsigned long long remainder = significand & ((1ull << shift) - 1ull);",
+            "    unsigned long long halfway = 1ull << (shift - 1);",
+            "    if (remainder > halfway || (remainder == halfway && (kept & 1ull))) {",
+            "      kept += 1ull;",
+            "    }",
+            "    if (kept >= 128ull) {",
+            "      return (unsigned short)((sign << 15) | 0x0080u);",
+            "    }",
+            "    return (unsigned short)((sign << 15) | kept);",
+            "  }",
+            "}",
+            "",
+            '__attribute__((visibility("hidden")))',
+            "float __truncsfbf2(float value) {",
+            "  return tilelang_riscv_f32_from_bf16_bits(tilelang_riscv_bf16_from_f32_bits(value));",
+            "}",
+            "",
+            '__attribute__((visibility("hidden")))',
+            "float __truncdfbf2(double value) {",
+            "  return tilelang_riscv_f32_from_bf16_bits(tilelang_riscv_bf16_from_f64_bits(value));",
+            "}",
+            "",
+        ]
+    )
+
+
+def _emit_bf16_abi_helpers(llvm_ir: str) -> str:
+    # The libcall names are introduced later, during target legalization
+    # (`fptrunc ... to bfloat` turns into __truncsfbf2 when the object is
+    # emitted), so detect bf16 by its type in the LLVM-dialect IR instead.
+    if "bfloat" not in llvm_ir:
+        return ""
+    return _bf16_abi_helper_source()
+
+
 def _emit_host_helper_source(llvm_ir: str) -> str:
     helper_parts = [
         _emit_ptr_to_memref_helpers(llvm_ir),
         _emit_f8_conversion_helpers(llvm_ir),
         _emit_f4_conversion_helpers(llvm_ir),
         _emit_math_helpers(llvm_ir),
+        _emit_bf16_abi_helpers(llvm_ir),
     ]
     return "\n".join(part for part in helper_parts if part)
 
@@ -819,7 +934,12 @@ def _freestanding_runner_source(signature: _FunctionSignature, args: tuple[Any, 
     magic_bytes = ", ".join(str(byte) for byte in _QEMU_OUTPUT_MAGIC)
     write_block = "\n".join(write_backs)
 
-    source = f"""typedef unsigned long tl_size;
+    # The freestanding harness is linked from a prebuilt kernel object, so
+    # LLVM libcalls to __truncsfbf2 / __truncdfbf2 have no MLIR runtime to
+    # resolve against.  Always provide local hidden versions to (a) make bf16
+    # kernels link and (b) deliver the result through the FP register the
+    # caller reads.  Unused copies are harmless for non-bf16 kernels.
+    source = _bf16_abi_helper_source() + f"""typedef unsigned long tl_size;
 typedef long tl_long;
 
 extern void tilelang_kernel_entry({prototype}) __asm__("{symbol_name}");
